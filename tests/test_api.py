@@ -36,10 +36,12 @@ def test_full_flow_create_train_add_search():
         r = client.post("/collections/demo", json={
             "dim": dim, "nlist": 5, "pq_m": 4, "pq_k": 8,
             "store_full_vectors": True,
+            "pq_mode": "residual",
         })
         assert r.status_code == 200, r.text
 
-        r = client.post("/collections/demo/train", json={"vectors": train_vectors})
+        r = client.post("/collections/demo/train", json={
+            "vectors": train_vectors, "coarse_training": "accumulated"})
         assert r.status_code == 200, r.text
 
         # add 20 known vectors
@@ -72,6 +74,8 @@ def test_full_flow_create_train_add_search():
         assert stats["compacted"] is True
         assert stats["store_full_vectors"] is True
         assert stats["routing_backend"] == "numpy"
+        assert stats["pq_mode"] == "residual"
+        assert stats["coarse_training"] == "accumulated"
         assert stats["raw_vector_bytes"] == 20 * dim * 4
         print(f"PASS: stats endpoint reports {stats}")
 
@@ -146,10 +150,16 @@ def test_error_handling():
         })
         assert r.status_code == 400, "unsupported routing backend should be rejected"
 
-        client.post("/collections/errtest", json={"dim": dim, "nlist": 2, "pq_m": 2})
+        r = client.post("/collections/badpq", json={
+            "dim": dim, "nlist": 2, "pq_m": 2, "pq_mode": "mystery"})
+        assert r.status_code == 400
+
+        client.post("/collections/errtest", json={
+            "dim": dim, "nlist": 2, "pq_m": 2, "pq_k": 8})
 
         # duplicate creation
-        r = client.post("/collections/errtest", json={"dim": dim, "nlist": 2, "pq_m": 2})
+        r = client.post("/collections/errtest", json={
+            "dim": dim, "nlist": 2, "pq_m": 2, "pq_k": 8})
         assert r.status_code == 409
 
         # search before training
@@ -162,6 +172,16 @@ def test_error_handling():
 
         # train with wrong dim
         r = client.post("/collections/errtest/train", json={"vectors": [[0, 0, 0]] * 10})
+        assert r.status_code == 400
+
+        # Finish training so routing-control validation reaches the search path.
+        vectors = np.random.rand(20, dim).tolist()
+        r = client.post("/collections/errtest/train", json={"vectors": vectors})
+        assert r.status_code == 200
+        client.post("/collections/errtest/vectors", json={
+            "ids": list(range(20)), "vectors": vectors})
+        r = client.post("/collections/errtest/search", json={
+            "vector": vectors[0], "nprobe": 1, "max_candidates": 10})
         assert r.status_code == 400
 
         print("PASS: all error-handling checks behaved as expected")
