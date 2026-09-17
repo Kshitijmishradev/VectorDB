@@ -1,273 +1,404 @@
-# vectordb
+# VectorDB from Scratch
 
-A vector database built entirely from scratch: no faiss, no hnswlib, no
-sklearn, no external ANN library of any kind. Every algorithm here
-(exact search, HNSW, product quantization, IVF, k-means) is implemented
-directly in numpy, tested against real ground truth, and benchmarked
-with real numbers, on real hardware, not simulated or assumed.
+![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![NumPy](https://img.shields.io/badge/core-NumPy-013243?logo=numpy&logoColor=white)
+![25M vectors](https://img.shields.io/badge/tested-25M_vectors-2ea44f)
+![Last commit](https://img.shields.io/github/last-commit/Kshitijmishradev/VectorDB)
 
-The goal wasn't just "make something that returns nearest neighbors."
-It was to understand, at the level of actually writing the code, how
-systems like Pinecone, Weaviate, Qdrant, and Chroma work internally, and
-to prove that understanding with measured evidence rather than
-citations. Every claim in this README and in [`RESULTS.md`](./RESULTS.md)
-is backed by a test or a benchmark you can re-run yourself.
+A disk-backed approximate-nearest-neighbor database implemented directly in
+Python and NumPy—without FAISS, hnswlib, scikit-learn, or another ANN library.
 
-## What it actually does
+The repository builds the search stack one layer at a time: exact search,
+HNSW, product quantization, HNSW+PQ, and finally a persistent IVF+PQ index with
+batched ingestion, memory-mapped postings, exact shortlist reranking, a REST
+API, and optional Apple Silicon GPU routing through MLX.
 
-Store high-dimensional vectors, and given a query vector, find its k
-nearest neighbors, fast, at scale, without needing the whole dataset in
-memory. This is the core operation behind semantic search, recommendation
-systems, RAG pipelines, and image similarity search.
+> This is an educational systems project with real persistence, tests, and
+> large-scale measurements. It is not presented as a production replacement
+> for FAISS, Qdrant, Pinecone, or Weaviate.
 
-```
-POST /collections/products {"dim": 64, "nlist": 50}
-POST /collections/products/train {"vectors": [[...], ...]}
-POST /collections/products/vectors {"ids": [1,2,3], "vectors": [[...], [...], [...]]}
-POST /collections/products/search {"vector": [...], "k": 5}
--> {"ids": [42, 17, 891, 3, 256], "distances": [0.12, 0.31, 0.44, 0.51, 0.58]}
-```
+[Results](#25-million-vector-result) · [Architecture](#architecture) ·
+[Quick start](#quick-start) · [API](#rest-api) ·
+[Benchmarks](#reproducing-the-benchmarks) · [Limitations](#current-limitations)
 
-## The architecture, and why each piece exists
+## 25-million-vector result
 
-Built in this order, each stage solving a specific limitation of the one
-before it:
+Measured locally on a MacBook Pro with an M3 Pro and 18 GB unified memory:
 
-| Stage | File | Solves | Cost |
-|---|---|---|---|
-| **Brute force** | `brute_force.py` | Ground truth: exact, always correct | O(n) per query, no compression |
-| **HNSW** | `hnsw.py` | O(log n)-ish search via a multi-layer navigable graph | Still stores full float vectors in RAM |
-| **Product Quantization** | `pq.py` | 8-32x memory compression via learned codebooks | Lossy; recall/compression is a real tradeoff |
-| **HNSW + PQ** | `hnsw_pq.py` | Combines graph speed with compressed storage | Build is slower (more work per insertion) |
-| **IVF + PQ** | `ivf_pq.py` | Disk-backed storage; RAM only holds a tiny routing index | Coarser-grained approximation (`nprobe` tradeoff) |
+| Metric | Result |
+|---|---:|
+| Vectors | 25,000,000 |
+| Dimensions | 64 (`float32`) |
+| IVF configuration | `nlist=20,000`, `nprobe=1,000` |
+| PQ configuration | `m=16`, 16-byte code |
+| Training time | 62.6 s |
+| Build time | 350.5 s |
+| Build throughput | **71,331 vectors/s** |
+| Compaction time | 4.2 s |
+| Total indexing time | 417.3 s |
+| Packed query latency | **141.5 ms** |
+| Unpacked query latency | 248.9 ms |
+| Packed-read speedup | **1.76×** |
+| Recall@10 with exact top-100 reranking | **0.833** |
+| Resident index structures | 10.4 MiB |
+| Final index size with raw vectors | 6.71 GiB |
 
-**Brute force** computes the distance from a query to every stored
-vector and returns the smallest k. Always exactly correct, and this is
-what every approximate method's answers get checked against
-(`recall@10`, used throughout this project, means "what fraction of
-brute force's true top-10 did the approximate method actually find").
+The full machine-readable result is in
+[`results/benchmark_25m_rerank_mlx.json`](./results/benchmark_25m_rerank_mlx.json).
 
-**HNSW** (Hierarchical Navigable Small World graphs) builds a multi-layer
-graph where each vector links to its nearest neighbors, with higher
-layers acting as a coarse "highway system" for fast approximate
-traversal. Search greedily hops toward the query, funneling down through
-layers. `ef_search` is the speed/recall dial: search more candidates,
-better recall, slower.
+The recall value above uses three exact full-dataset queries because computing
+ground truth requires scanning all 25 million vectors. Treat it as a measured
+large-scale checkpoint, not a statistically complete ANN evaluation. The
+benchmark uses deterministic uniformly distributed synthetic vectors and
+squared L2 distance; comparisons with other projects are meaningful only when
+the dataset, hardware, and quality target are also comparable.
 
-**Product Quantization** compresses each vector by splitting it into
-subspaces, running k-means per subspace to find representative
-"centroids," and storing which centroid each subspace is closest to (a
-single byte) instead of the real floats. Distance to a compressed vector
-is computed via a precomputed lookup table (Asymmetric Distance
-Computation), not by decompressing anything, so it's both smaller and
-fast.
+### Performance progression
 
-**HNSW + PQ** stores a PQ code (a few bytes) at each graph node instead
-of a full vector, this is what Faiss's `IndexIVFPQ` and similar
-production systems do: graph speed, compressed storage, one shared
-distance table per query reused across the whole traversal.
+| Engineering stage | Measured result |
+|---|---:|
+| Scalar insertion path, 10M run | 1,959 vectors/s |
+| Batched NumPy insertion, 25M run | 40,821 vectors/s |
+| Batched insertion + MLX routing, 25M run | **71,331 vectors/s** |
+| Per-cluster query files | 248.9 ms/query |
+| Packed memory-mapped postings | **141.5 ms/query** |
+| PQ-only recall@10 at 25M | 0.500 |
+| Exact top-100 reranked recall@10 at 25M | **0.833** |
 
-**IVF + PQ** is the one that actually answers "how do you get past what
-fits in RAM": the dataset is coarse-clustered into `nlist` groups
-(k-means on full vectors), only the centroids stay in memory (a few MB,
-independent of dataset size), and every actual vector is PQ-compressed.
-Ingestion initially uses per-cluster files, then `compact()` packs them into
-one offset-indexed, memory-mapped `postings.bin`. A query compares against all
-centroids, picks the `nprobe` nearest clusters, and slices those lists from the
-mapping without opening one file per cluster. New inserts use small delta
-files until the next compaction. An optional raw-vector sidecar enables exact
-reranking of a small PQ shortlist: IVF+PQ narrows millions of vectors to (for
-example) 100 candidates, then exact L2 chooses the final 10. This is
-architecturally close to Microsoft's SPANN and Faiss's `IndexIVFPQ`.
+MLX accelerates coarse routing during ingestion only. Query execution remains
+on the CPU. At the representative `100,000 × 20,000 × 64` routing shape, MLX
+matched every NumPy assignment and made that stage 2.96× faster. See
+[`results/gpu_routing_benchmark.json`](./results/gpu_routing_benchmark.json).
 
-## The engineering, not just the algorithms
+## Architecture
 
-This is the part that actually took the most effort, and it's the part
-most "from scratch" projects skip.
-
-### The same bug, found and fixed seven separate times
-
-Every serious performance problem in this project traced back to one
-root cause: a Python-level `for` loop where a single vectorized numpy
-call would do the same work at C speed. This wasn't found once and
-generalized, it was independently rediscovered in five different files,
-each time root-caused and fixed with real before/after measurements
-rather than a guessed threshold change:
-
-1. **HNSW's distance batching** — per-neighbor Python loop → `np.stack` + one matmul
-2. **HNSW's insertion path** — dict-of-vectors + list comprehension → a preallocated numpy matrix with internal integer indices (build time at n=10,000: 191.9s → 70.0s → 13.2s across two separate fixes)
-3. **PQ's `asymmetric_distances`/`decode`** — per-subspace Python loop → `table[idx, codes]` fancy-indexing (this alone made combined HNSW+PQ build 1.87x faster and query 2.4x faster)
-4. **IVF's `_read_cluster`** — per-record `struct.unpack_from` loop → one `np.frombuffer` call with a structured dtype, caught by code review before it ever caused a slow benchmark
-5. **IVF and PQ's own k-means training** — an `(n, k, dim)` broadcast distance array, fine for PQ's small subspaces, but at IVF's scale (`nlist` in the thousands, full vector dimensionality) this **actually OOM-killed the process** at ~13GB for one intermediate array. Fixed with the expanded distance identity (`|a-b|² = |a|² - 2a·b + |b|²`) computed in row-chunks, bounding peak memory to `O(batch_size × k)` instead of `O(n × k)`.
-6. **IVF ingestion** — the streaming benchmark generated input in batches but still routed, PQ-encoded, and opened a posting-list file once per vector. `add_batch()` now routes with bounded BLAS matrix multiplications, encodes PQ in chunks, groups records by cluster, and writes once per non-empty cluster. At `nlist=12,649`, a 100,000-vector hot-path benchmark improved from roughly 2,073 to 55,872 vectors/sec.
-7. **IVF query reads** — probing 1,000 clusters meant 1,000 separate `open`/`read`/`close` cycles for every query. `compact()` now writes one immutable posting segment plus a 20,001-entry offset table and keeps the segment memory-mapped. A 200,000-vector comparison reduced average query time from 2.079ms to 0.910ms (2.29x) while returning identical results and opening zero posting files during compacted search.
-8. **Exact shortlist reranking** — optional `store_full_vectors=True` appends each float32 vector to a memory-mapped sidecar and stores its row number in the posting record. `search(..., rerank=100)` performs ordinary IVF+PQ candidate selection, reads only those 100 original vectors, and reorders them by exact L2. On a 200,000-vector sweep at `nprobe=256`, recall@10 improved from 0.480 to 0.787 with a 100-vector shortlist, while median latency stayed around 3.1ms.
-9. **Apple GPU ingestion routing** — `routing_backend="mlx"` moves the coarse vector-to-centroid matrix multiplication to the Apple Silicon Metal GPU. It does not change PQ encoding, posting writes, search, or the index format. At the 100,000 x 20,000 x 64 routing shape, the isolated benchmark measured 1.644s for NumPy vs 0.543s for MLX (3.03x) with identical assignments.
-
-### Honest, measured tradeoffs, not hand-waved ones
-
-Every tunable parameter in this project (`ef_search`, PQ's `m`, IVF's
-`nprobe`) has a real measured recall-vs-speed curve behind it, not a
-default picked by feel:
-
-- `ef_search` fixed at 50 caused recall to collapse from 0.997 (n=1,000) to 0.593 (n=50,000). Fixed with an empirically-calibrated scaling formula (`max(30, M·log₂(n))`).
-- PQ's `m=8` gives 32x compression but recall@10=0.393; `m=16` gives 16x compression and recall@10=0.680; `m=32` gives 8x and 0.893. All three measured, not estimated.
-- IVF's `nprobe` sweep (1 → 5 → 20) showed recall climbing 0.200 → 0.470 → 0.665, monotonically, confirming the routing logic is actually working correctly, not just "roughly okay."
-
-### A cross-platform correctness bug, caught by not trusting a suspicious number
-
-A benchmark run on the author's Mac reported a process memory reading
-over a billion (in a field labeled KB). Rather than dismiss it as a
-fluke, it was root-caused: Python's `resource.getrusage().ru_maxrss` has
-OS-dependent units (kilobytes on Linux, bytes on macOS, and inconsistent
-in practice across different measurement scales on the same machine).
-Verified directly against a live process using `ps -o rss=` before
-trusting any fix, then replaced the ambiguous field entirely with a
-`ps`-based reading that's unambiguous on both platforms.
-
-### A benchmark that scales the way the database does
-
-The original large-scale benchmark script pre-generated its entire
-synthetic test dataset in one array before inserting anything, at
-n=1,000,000 that's 256MB just for test input, at n=1,000,000,000 it's
-256GB, impossible on a laptop regardless of how good the actual
-database's memory story is. Rewritten to stream the dataset in batches,
-discarding each batch immediately after insertion, so the *test
-harness's* memory stays flat too, not just the database's. Verified the
-fix with a direct measurement: RSS grew by exactly one batch's worth of
-data during a streamed 300,000-vector build, not the full dataset's
-worth.
-
-### Persistence: the database survives a restart
-
-`IVFPQIndex.save()`/`.load()` persist the routing index (centroids + PQ
-codebooks + cluster sizes + packed offsets) to a small file; `postings.bin`
-holds the immutable packed base and per-cluster delta files hold later
-inserts. Tested the following real claims, not
-just "does it not crash": a reloaded index returns byte-identical search
-results to before the save; bookkeeping (`total_vectors`,
-`resident_memory_bytes`) reports correctly after reload; and a reloaded
-index can keep accepting new inserts, with a vector added after reload
-actually being findable.
-
-### A real REST API, with correctness proven under an actual simulated restart
-
-`api.py` wraps `IVFPQIndex` in a FastAPI service (`create` / `train` /
-`add` / `compact` / `search` / `stats` per named "collection", plus auto-generated
-interactive docs at `/docs`). The persistence work is what makes this
-safe to run as an actual service: every mutation auto-saves, and server
-startup automatically reloads every collection found on disk. This was
-tested by literally wiping the in-memory collection registry mid-test
-(simulating a real process crash) and confirming a fresh client
-reloads the collection with the right vector count and correct search
-results, not just checking the save/load functions in isolation.
-
-## Real, measured results
-
-The headline number, from the author's own MacBook, not a cloud sandbox:
-
-```
-n = 1,000,000 vectors, dim = 64
-build:            226s     (4,425 vectors/sec)
-query latency:    7.5ms
-recall@10:        0.37     (stable across every scale tested, 5,000 to 1,000,000)
-resident memory:  1.06 MB  <- for one million vectors
-disk used:        22.9 MB
+```mermaid
+flowchart LR
+    A[Query vector] --> B[Compare with IVF centroids]
+    B -->|select nprobe lists| C[Memory-mapped postings.bin]
+    C --> D[PQ asymmetric-distance scan]
+    D -->|top rerank candidates| E[Raw-vector sidecar]
+    E --> F[Exact L2 reranking]
+    F --> G[Final top-k IDs]
 ```
 
-One megabyte of RAM for a million searchable vectors. That number stays
-essentially flat at any scale, because it depends on `nlist` (which
-grows as `√n`), not on the number of vectors stored. Full numbered
-session log, every benchmark, every bug, every before/after measurement,
-is in [`RESULTS.md`](./RESULTS.md).
+The final index is an IVFADC-style pipeline:
 
-## What's honestly still missing
+1. **IVF routing** assigns each vector to its nearest coarse centroid.
+2. **Product quantization** compresses a 64-dimensional float vector from
+   256 bytes to a 16-byte code when `pq_m=16`.
+3. **Posting lists** store IDs and PQ codes on disk instead of retaining the
+   dataset in Python objects.
+4. **Compaction** merges per-cluster files into one offset-indexed,
+   memory-mapped `postings.bin`, eliminating one file open per probed cluster.
+5. **ADC search** evaluates compressed candidates with a per-query lookup
+   table without reconstructing every vector.
+6. **Optional reranking** fetches only a small shortlist from
+   `raw_vectors.f32` and computes exact L2 distances before returning top-k.
 
-This project does not claim to be a production-grade database. Known
-gaps, listed rather than glossed over:
+New inserts after compaction are written to small delta files. Running
+`compact()` again merges those deltas into a new immutable posting segment.
 
-- **No delete/update.** Every posting list is append-only.
-- **Reranking costs disk.** It is opt-in because retaining float32 vectors adds 256 bytes per 64-dimensional vector. At 25M vectors, the final raw-vector-plus-posting index is about 6.71 GiB instead of about 572 MiB for PQ-only storage.
-- **No concurrency safety.** FastAPI dispatches synchronous endpoints to a real OS thread pool by default, and shared state (cluster file writes, in-memory counters) has no locking. Two simultaneous writes to the same collection can race.
-- **No auth, no streaming uploads, no metadata filtering.** Request-level
-  ingestion is batched, but very large uploads still need a streaming API.
+### Algorithms implemented
 
-## Project structure
+| Component | Source | Purpose |
+|---|---|---|
+| Exact brute force | `vectordb/brute_force.py` | Ground truth and correctness baseline |
+| HNSW | `vectordb/hnsw.py` | Graph-based approximate search |
+| Product Quantization | `vectordb/pq.py` | Learned lossy vector compression |
+| HNSW + PQ | `vectordb/hnsw_pq.py` | Compressed graph search |
+| IVF + PQ | `vectordb/ivf_pq.py` | Disk-backed large-scale index |
+| MLX routing | `vectordb/mlx_routing.py` | Optional Apple GPU ingestion backend |
+| REST service | `vectordb/api.py` | Persistent named collections over HTTP |
 
-```
-vectordb/
-  brute_force.py     exact search, the ground truth
-  hnsw.py             graph-based ANN search
-  pq.py               product quantization + PQFlatIndex
-  hnsw_pq.py           HNSW graph + PQ-compressed storage
-  ivf_pq.py            disk-backed IVF + PQ, with save()/load()
-  mlx_routing.py        optional Apple Silicon GPU ingestion router
-  api.py               FastAPI REST wrapper (collections, train, add, search)
+## Features
 
-tests/                 complete correctness and API integration suite
-benchmark.py            HNSW vs brute force benchmark sweep
-bench_ivf.py            large-scale IVF+PQ benchmark (streaming, no memory cliff)
-bench_tuning.py         measured nprobe latency/recall sweep
-bench_gpu_routing.py    isolated NumPy CPU vs MLX GPU routing benchmark
-run_api.py              start the REST API as a real local server
-RESULTS.md              the full, honest, numbered log of every session
-results/                saved JSON benchmark evidence
-archive/                superseded one-off benchmark drivers
-```
+- Exact and approximate nearest-neighbor search using squared L2 distance.
+- Streaming, batched ingestion with bounded working memory.
+- NumPy/BLAS CPU routing and optional MLX/Metal routing on Apple Silicon.
+- PQ compression with configurable subspace count.
+- Packed, offset-indexed, memory-mapped posting lists.
+- Exact top-N reranking backed by a raw-vector sidecar.
+- Persistent save/load with continued insertion after restart.
+- Named collections exposed through FastAPI.
+- Deterministic benchmark generation and exact recall measurement.
+- Unit and integration coverage for every index stage.
 
-## Running it yourself
+## Quick start
 
 ```bash
+git clone https://github.com/Kshitijmishradev/VectorDB.git
+cd VectorDB
+
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# correctness, every module and integration path
 python3 -m pytest
-
-# one file directly, when iterating on a specific feature
-python3 -m tests.test_ivf_pq_rerank
-
-# benchmarks
-python3 benchmark.py
-python3 bench_ivf.py 1000000      # takes a few minutes; no upper limit besides time and disk
-python3 bench_ivf.py 200000 --compare-unpacked-query  # measure packed read speedup
-python3 bench_tuning.py 200000     # choose nprobe from latency + recall, not a percentage
-python3 bench_gpu_routing.py --vectors 100000 --nlist 20000 \
-  --json results/gpu_routing_benchmark.json
-
-# Measure the nprobe + rerank recall/latency curve before a large run
-python3 bench_tuning.py 200000 --nprobes 64,128,256 \
-  --rerank-values 0,50,100,200
-
-# 25M preflight, then a memory-bounded run with durable JSON results
-python3 bench_ivf.py 25000000 --dry-run
-python3 bench_ivf.py 25000000 --progress-every 1000000 \
-  --json results/benchmark_25m.json
-
-# Faster approximate training (validate recall with bench_tuning.py first)
-python3 bench_ivf.py 25000000 --train-minibatch-size 200000 \
-  --pq-train-size 200000 --progress-every 1000000 \
-  --json results/benchmark_25m_fast.json
-
-# Apple Silicon build routing + exact top-100 reranking. Final index is ~6.71 GiB.
-python3 bench_ivf.py 25000000 --train-minibatch-size 200000 \
-  --pq-train-size 200000 --routing-backend mlx --rerank 100 \
-  --progress-every 1000000 --recall-queries 3 --compare-unpacked-query \
-  --keep-storage \
-  --json results/benchmark_25m_rerank_mlx.json
-
-# Compare the fast-training recall/latency curve on a manageable sample first
-python3 bench_tuning.py 200000 --train-minibatch-size 200000 --pq-train-size 200000
-
-# the API, as an actual running server
-python3 run_api.py
-# then open http://localhost:8000/docs
 ```
 
-## Why this project exists
+`mlx` is installed only on Apple Silicon through the environment marker in
+`requirements.txt`. Use `routing_backend="numpy"` everywhere else.
 
-Built as a portfolio project to demonstrate genuine understanding of how
-vector search systems work, not just the ability to call a library.
-Every design decision above was driven by hitting a real limitation
-(too slow, too much memory, doesn't survive a restart, doesn't scale
-past RAM) and fixing it with a specific, measured, explainable change,
-the same way a real engineering team would.
+### Use the index from Python
+
+```python
+import numpy as np
+
+from vectordb.ivf_pq import IVFPQIndex
+
+rng = np.random.default_rng(0)
+vectors = rng.random((10_000, 64), dtype=np.float32)
+ids = np.arange(len(vectors), dtype=np.int64)
+
+index = IVFPQIndex(
+    dim=64,
+    nlist=256,
+    pq_m=16,
+    storage_dir="./data/example",
+    store_full_vectors=True,
+    routing_backend="numpy",  # use "mlx" on Apple Silicon
+)
+
+index.train(vectors[:8_000], n_iters=10)
+index.add_batch(vectors, ids)
+index.compact()
+index.save()
+
+query = rng.random(64, dtype=np.float32)
+neighbor_ids, squared_l2 = index.search(
+    query,
+    k=10,
+    nprobe=32,
+    rerank=100,
+)
+
+print(neighbor_ids)
+print(squared_l2)
+index.close()
+```
+
+Reload the same index without retraining:
+
+```python
+index = IVFPQIndex.load("./data/example")
+neighbor_ids, distances = index.search(query, k=10, nprobe=32, rerank=100)
+index.close()
+```
+
+## REST API
+
+Start the local server:
+
+```bash
+python3 run_api.py
+```
+
+Interactive OpenAPI documentation is available at
+[`http://localhost:8000/docs`](http://localhost:8000/docs).
+
+Example collection lifecycle:
+
+```bash
+# Create an exact-rerank-capable collection.
+curl -X POST http://localhost:8000/collections/products \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "dim": 4,
+    "nlist": 2,
+    "pq_m": 2,
+    "pq_k": 4,
+    "store_full_vectors": true,
+    "routing_backend": "numpy"
+  }'
+
+# Train using a representative vector sample.
+curl -X POST http://localhost:8000/collections/products/train \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "vectors": [
+      [0.0, 0.0, 0.0, 0.0],
+      [1.0, 1.0, 1.0, 1.0],
+      [0.0, 1.0, 0.0, 1.0],
+      [1.0, 0.0, 1.0, 0.0]
+    ]
+  }'
+
+# Add vectors and their external IDs.
+curl -X POST http://localhost:8000/collections/products/vectors \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ids": [101, 102],
+    "vectors": [[0.1, 0.2, 0.3, 0.4], [0.8, 0.7, 0.9, 0.6]]
+  }'
+
+# Pack postings, then search with exact shortlist reranking.
+curl -X POST http://localhost:8000/collections/products/compact
+curl -X POST http://localhost:8000/collections/products/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "vector": [0.1, 0.2, 0.3, 0.4],
+    "k": 2,
+    "nprobe": 2,
+    "rerank": 2
+  }'
+```
+
+## Tuning the index
+
+| Parameter | Effect |
+|---|---|
+| `nlist` | Number of coarse IVF clusters. More lists reduce average list size but increase training and routing work. |
+| `nprobe` | Lists scanned per query. This is the primary latency/recall control. |
+| `pq_m` | PQ subspaces and bytes per code. Higher values use more disk but preserve more information. Must divide `dim`. |
+| `rerank` | Number of PQ finalists reordered with exact L2. Requires raw-vector storage. |
+| `store_full_vectors` | Enables reranking at the cost of `dim × 4` additional bytes per vector. |
+| `routing_backend` | `numpy` everywhere; `mlx` optionally accelerates ingestion on Apple Silicon. |
+
+At 25M vectors, `nprobe=1,000` scans approximately 1.25M PQ candidates per
+query. That explains the 141 ms latency even after file-open overhead is
+removed. A three-query sweep on the retained 25M index measured the following
+quality trend with `rerank=100`:
+
+| `nprobe` | Approx. candidates | Recall@10 |
+|---:|---:|---:|
+| 125 | 156,250 | 0.500 |
+| 250 | 312,500 | 0.600 |
+| 500 | 625,000 | 0.700 |
+| 750 | 937,500 | 0.767 |
+| 1,000 | 1,250,000 | 0.833 |
+
+Use `bench_tuning.py` on data representative of the target workload instead
+of choosing `nprobe` as a fixed percentage by habit.
+
+## Reproducing the benchmarks
+
+### Fast local checks
+
+```bash
+# Recall/latency sweep with exact reranking.
+python3 bench_tuning.py 200000 \
+  --nprobes 64,128,256 \
+  --rerank-values 0,50,100,200
+
+# Packed versus per-cluster query reads.
+python3 bench_ivf.py 200000 --compare-unpacked-query
+
+# NumPy versus MLX routing; Apple Silicon only.
+python3 bench_gpu_routing.py \
+  --vectors 100000 \
+  --nlist 20000 \
+  --json results/gpu_routing_benchmark.json
+```
+
+### Full 25M run
+
+The reranked index requires approximately 6.71 GiB when complete and about
+7.64 GiB temporarily during compaction.
+
+```bash
+python3 bench_ivf.py 25000000 --dry-run \
+  --routing-backend mlx \
+  --rerank 100
+
+python3 bench_ivf.py 25000000 \
+  --train-minibatch-size 200000 \
+  --pq-train-size 200000 \
+  --routing-backend mlx \
+  --rerank 100 \
+  --progress-every 1000000 \
+  --recall-queries 3 \
+  --compare-unpacked-query \
+  --keep-storage \
+  --json results/benchmark_25m_rerank_mlx.json
+```
+
+`bench_ivf.py` streams generated vectors rather than allocating the complete
+dataset. With `--keep-storage`, the benchmark index remains at
+`/tmp/ivf_bench_storage`; move it to durable storage if it must survive a
+restart or operating-system cleanup.
+
+## Storage layout
+
+```text
+storage_dir/
+├── index_meta.npz       # centroids, PQ codebooks, sizes, offsets, settings
+├── postings.bin         # immutable compacted posting records
+├── raw_vectors.f32      # optional float32 sidecar used by reranking
+└── delta_<cluster>.bin  # inserts received after the last compaction
+```
+
+Without raw-vector reranking, a 64-dimensional vector with `pq_m=16` uses a
+24-byte posting record: an 8-byte external ID plus a 16-byte PQ code. With
+reranking enabled, the posting gains an 8-byte raw-row pointer and the sidecar
+stores the original 256-byte vector.
+
+## Tests
+
+```bash
+# Entire suite
+python3 -m pytest
+
+# A focused module without pytest collection
+python3 -m tests.test_ivf_pq_rerank
+```
+
+The suite covers exact search, HNSW, PQ quality/compression, HNSW+PQ, IVF
+recall, batched versus scalar insertion, persistence, packed reads, delta
+re-compaction, raw-vector reranking, benchmark ground truth, and the REST API's
+restart behavior.
+
+See [`tests/README.md`](./tests/README.md) for the test map.
+
+## Project layout
+
+```text
+vectordb/                 search engines and REST service
+tests/                    unit and integration tests
+results/                  saved benchmark evidence
+archive/                  superseded one-off benchmark drivers
+benchmark.py              brute-force versus HNSW benchmark
+bench_ivf.py              streaming IVF+PQ scale benchmark
+bench_tuning.py           nprobe/rerank recall-latency sweep
+bench_gpu_routing.py      NumPy versus MLX routing benchmark
+run_api.py                local FastAPI entry point
+RESULTS.md                chronological engineering and benchmark log
+```
+
+## Current limitations
+
+- **Append-only records:** individual vector update and deletion are not yet
+  implemented.
+- **Single-writer assumptions:** collection mutations are not protected by
+  process or thread-level locking.
+- **No metadata filtering:** search operates only on vector distance.
+- **No authentication or authorization:** the REST service is intended for
+  local development.
+- **Request-buffered API ingestion:** very large HTTP uploads need a streaming
+  ingestion endpoint.
+- **CPU query scan:** MLX currently accelerates ingestion routing, not PQ query
+  evaluation.
+- **Synthetic benchmark dataset:** the included large-scale results do not
+  replace evaluation on domain-specific embeddings or standard ANN datasets.
+
+## Engineering notes
+
+The most useful part of this project is the progression from correct code to
+code that survives realistic scale:
+
+- Replaced `(n, k, dim)` broadcast tensors with the expanded squared-distance
+  identity and bounded row chunks.
+- Replaced per-vector centroid searches and PQ encoding with batch operations.
+- Grouped records by cluster so each non-empty posting file is opened once per
+  ingestion batch instead of once per vector.
+- Replaced per-record binary parsing with NumPy structured views.
+- Replaced 1,000 query-time file opens with one packed memory map and an offset
+  table.
+- Added a raw-vector sidecar so lossy PQ ranking can be corrected without
+  scanning full-precision vectors for the complete candidate set.
+- Isolated the optional Metal implementation in `mlx_routing.py`, keeping the
+  default NumPy path dependency-free and the disk format backend-neutral.
+
+For the complete chronological record—including failed approaches, memory
+bugs, before/after measurements, and design decisions—read
+[`RESULTS.md`](./RESULTS.md).
