@@ -1,0 +1,27 @@
+[
+  {
+    "name": "optimized",
+    "dataset": "sift-128-euclidean",
+    "n": 1000000,
+    "dim": 128,
+    "queries": 10000,
+    "nlist": 4096,
+    "candidate_budget": 20000,
+    "average_candidates_scanned": 20253.5,
+    "pq_mode": "residual",
+    "pq_m": 32,
+    "rerank": 100,
+    "recall_at_1": 0.9782,
+    "recall_at_10": 0.9701,
+    "first_query_ms": 12.484,
+    "p50_ms": 9.3691,
+    "p95_ms": 13.4028,
+    "p99_ms": 14.6929,
+    "qps": 104.05,
+    "train_time_s": 11.568,
+    "build_time_s": 10.669,
+    "compact_time_s": 0.299,
+    "index_bytes": 560000000,
+    "resident_index_bytes": 4456456
+  }
+]
