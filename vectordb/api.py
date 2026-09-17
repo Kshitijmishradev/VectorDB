@@ -31,7 +31,7 @@ by add() itself.
 import os
 import shutil
 from contextlib import asynccontextmanager
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -97,11 +97,15 @@ class CreateCollectionRequest(BaseModel):
         False, description="store float32 vectors to enable exact reranking")
     routing_backend: str = Field(
         "numpy", description="ingestion routing backend: numpy or mlx")
+    pq_mode: str = Field(
+        "standard", description="PQ encoding mode: standard or residual")
 
 
 class TrainRequest(BaseModel):
     vectors: List[List[float]] = Field(
         ..., description="representative sample used to learn IVF centroids + PQ codebooks")
+    coarse_training: str = Field(
+        "legacy", description="coarse k-means mode: legacy or accumulated")
 
 
 class AddRequest(BaseModel):
@@ -112,7 +116,8 @@ class AddRequest(BaseModel):
 class SearchRequest(BaseModel):
     vector: List[float]
     k: int = 10
-    nprobe: int = 8
+    nprobe: Optional[int] = None
+    max_candidates: Optional[int] = None
     rerank: int = 0
 
 
@@ -130,6 +135,8 @@ class StatsResponse(BaseModel):
     compacted: bool
     store_full_vectors: bool
     routing_backend: str
+    pq_mode: str
+    coarse_training: str
     posting_bytes: int
     raw_vector_bytes: int
 
@@ -148,10 +155,14 @@ def create_collection(name: str, req: CreateCollectionRequest):
         raise HTTPException(
             status_code=400,
             detail="routing_backend must be 'numpy' or 'mlx'")
+    if req.pq_mode not in {"standard", "residual"}:
+        raise HTTPException(
+            status_code=400, detail="pq_mode must be 'standard' or 'residual'")
     idx = IVFPQIndex(req.dim, req.nlist, pq_m=req.pq_m, pq_k=req.pq_k,
                       storage_dir=_collection_dir(name),
                       store_full_vectors=req.store_full_vectors,
-                      routing_backend=req.routing_backend)
+                      routing_backend=req.routing_backend,
+                      pq_mode=req.pq_mode)
     _collections[name] = idx
     return {"status": "created", "name": name}
 
@@ -173,7 +184,15 @@ def train_collection(name: str, req: TrainRequest):
         raise HTTPException(
             status_code=400,
             detail=f"need at least nlist={idx.nlist} training vectors, got {len(vectors)}")
-    idx.train(vectors)
+    if len(vectors) < idx.pq.k:
+        raise HTTPException(
+            status_code=400,
+            detail=f"need at least pq_k={idx.pq.k} training vectors, got {len(vectors)}")
+    if req.coarse_training not in {"legacy", "accumulated"}:
+        raise HTTPException(
+            status_code=400,
+            detail="coarse_training must be 'legacy' or 'accumulated'")
+    idx.train(vectors, coarse_training=req.coarse_training)
     idx.save()
     return {"status": "trained", "training_vectors": len(vectors)}
 
@@ -212,17 +231,26 @@ def search_collection(name: str, req: SearchRequest):
         raise HTTPException(
             status_code=400,
             detail=f"expected a flat vector of dim {idx.dim}, got shape {query.shape}")
-    if req.k <= 0 or req.nprobe <= 0 or req.rerank < 0:
+    if req.k <= 0 or req.rerank < 0:
         raise HTTPException(
             status_code=400,
-            detail="k and nprobe must be positive and rerank must be non-negative")
+            detail="k must be positive and rerank must be non-negative")
+    if req.nprobe is not None and req.nprobe <= 0:
+        raise HTTPException(status_code=400, detail="nprobe must be positive")
+    if req.max_candidates is not None and req.max_candidates <= 0:
+        raise HTTPException(status_code=400, detail="max_candidates must be positive")
+    if req.nprobe is not None and req.max_candidates is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="nprobe and max_candidates are mutually exclusive")
     if req.rerank and not idx.store_full_vectors:
         raise HTTPException(
             status_code=400,
             detail="reranking requires a collection created with store_full_vectors=true")
 
     ids, dists = idx.search(
-        query, k=req.k, nprobe=req.nprobe, rerank=req.rerank)
+        query, k=req.k, nprobe=req.nprobe,
+        max_candidates=req.max_candidates, rerank=req.rerank)
     return SearchResult(ids=ids, distances=dists)
 
 
@@ -251,6 +279,8 @@ def collection_stats(name: str):
         compacted=idx.is_compacted,
         store_full_vectors=idx.store_full_vectors,
         routing_backend=idx.routing_backend,
+        pq_mode=idx.pq_mode,
+        coarse_training=idx.coarse_training,
         posting_bytes=idx.posting_bytes() if idx.is_trained else 0,
         raw_vector_bytes=idx.raw_vector_bytes() if idx.is_trained else 0,
     )
