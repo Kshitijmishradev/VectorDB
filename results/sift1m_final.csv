@@ -1,0 +1,2 @@
+name,dataset,n,dim,queries,nlist,candidate_budget,average_candidates_scanned,pq_mode,pq_m,rerank,recall_at_1,recall_at_10,first_query_ms,p50_ms,p95_ms,p99_ms,qps,train_time_s,build_time_s,compact_time_s,index_bytes,resident_index_bytes
+optimized,sift-128-euclidean,1000000,128,10000,4096,20000,20253.5,residual,32,100,0.9782,0.9701,12.484,9.3691,13.4028,14.6929,104.05,11.568,10.669,0.299,560000000,4456456
