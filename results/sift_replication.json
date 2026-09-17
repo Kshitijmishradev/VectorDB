@@ -1,0 +1,11 @@
+{
+  "replication_fraction": 0.25,
+  "candidate_budget": 20000,
+  "queries": 200,
+  "base_recall_at_10": 0.974,
+  "replicated_recall_at_10": 0.9695,
+  "absolute_gain": -0.0045,
+  "base_average_scanned_records": 20265.0,
+  "replicated_average_scanned_records": 20279.0,
+  "passes_0_02_gate": false
+}
