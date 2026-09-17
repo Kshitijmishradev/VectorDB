@@ -103,12 +103,14 @@ def _streaming_ground_truth(n, dim, queries, k, seed, batch_size,
     return best_ids
 
 
-def bench(n, dim=64, n_queries=30, k=10, pq_m=16, nprobe=None, seed=0,
+def bench(n, dim=64, n_queries=100, k=10, pq_m=16, nprobe=None,
+          nlist=None, max_candidates=None, seed=0,
           train_iters=15, batch_size=100_000, progress_every=200_000,
           train_minibatch_size=None, pq_train_size=None,
           keep_storage=False, json_output=None, large_recall_queries=0,
           compare_unpacked_query=False, store_full_vectors=False, rerank=0,
-          routing_backend="numpy"):
+          routing_backend="numpy", pq_mode="standard",
+          coarse_training="legacy", warmup_queries=5):
     if os.path.exists(STORAGE):
         shutil.rmtree(STORAGE)
 
@@ -128,8 +130,10 @@ def bench(n, dim=64, n_queries=30, k=10, pq_m=16, nprobe=None, seed=0,
             f"insufficient free disk: need about {required_disk_bytes / 2**30:.2f} GiB "
             f"including headroom, have {free_disk_bytes / 2**30:.2f} GiB")
 
-    nlist = max(int(4 * np.sqrt(n)), 16)
-    if nprobe is None:
+    nlist = nlist or max(int(4 * np.sqrt(n)), 16)
+    if nprobe is not None and max_candidates is not None:
+        raise ValueError("nprobe and max_candidates are mutually exclusive")
+    if nprobe is None and max_candidates is None:
         nprobe = max(1, nlist // 20)  # probe ~5% of clusters
 
     train_n = min(n, max(nlist * 40, 5000))
@@ -138,7 +142,8 @@ def bench(n, dim=64, n_queries=30, k=10, pq_m=16, nprobe=None, seed=0,
         dim, nlist=nlist, pq_m=pq_m, pq_k=256,
         storage_dir=STORAGE, seed=seed,
         store_full_vectors=store_full_vectors,
-        routing_backend=routing_backend)
+        routing_backend=routing_backend,
+        pq_mode=pq_mode)
 
     # --- train on a small representative sample. Bounded regardless of n
     # (see train_n above), so this was never the memory problem. ---
@@ -150,6 +155,7 @@ def bench(n, dim=64, n_queries=30, k=10, pq_m=16, nprobe=None, seed=0,
         n_iters=train_iters,
         minibatch_size=train_minibatch_size,
         pq_train_size=pq_train_size,
+        coarse_training=coarse_training,
     )
     train_time = time.perf_counter() - t0
     print(f"  [train done in {train_time:.1f}s, nlist={nlist} train_n={train_n}]", flush=True)
@@ -183,7 +189,8 @@ def bench(n, dim=64, n_queries=30, k=10, pq_m=16, nprobe=None, seed=0,
     if compare_unpacked_query:
         t0 = time.perf_counter()
         for q in queries:
-            idx.search(q, k=k, nprobe=nprobe, rerank=rerank)
+            idx.search(q, k=k, nprobe=nprobe,
+                       max_candidates=max_candidates, rerank=rerank)
         unpacked_query_time = (time.perf_counter() - t0) / n_queries
         print(f"  [unpacked query average: {unpacked_query_time * 1000:.3f} ms]",
               flush=True)
@@ -196,10 +203,20 @@ def bench(n, dim=64, n_queries=30, k=10, pq_m=16, nprobe=None, seed=0,
           f"{compact_time:.1f}s]", flush=True)
     rss_after = _rss_kb()
 
-    t0 = time.perf_counter()
+    search_kwargs = dict(
+        k=k, nprobe=nprobe, max_candidates=max_candidates, rerank=rerank)
+    first_start = time.perf_counter()
+    idx.search(queries[0], **search_kwargs)
+    first_query_time = time.perf_counter() - first_start
+    for warmup_idx in range(warmup_queries):
+        idx.search(queries[warmup_idx % len(queries)], **search_kwargs)
+
+    latencies = []
     for q in queries:
-        idx.search(q, k=k, nprobe=nprobe, rerank=rerank)
-    query_time = (time.perf_counter() - t0) / n_queries
+        query_start = time.perf_counter()
+        idx.search(q, **search_kwargs)
+        latencies.append(time.perf_counter() - query_start)
+    query_time = float(np.mean(latencies))
 
     # --- recall@10 against brute force, only below RECALL_MAX_N (see comment above) ---
     recall = None
@@ -219,7 +236,7 @@ def bench(n, dim=64, n_queries=30, k=10, pq_m=16, nprobe=None, seed=0,
         hits, total = 0, 0
         for q in queries:
             true_ids, _ = brute.search(q, k=k)
-            got_ids, _ = idx.search(q, k=k, nprobe=nprobe, rerank=rerank)
+            got_ids, _ = idx.search(q, **search_kwargs)
             hits += len(set(true_ids.tolist()) & set(got_ids))
             total += k
         recall = hits / total
@@ -233,8 +250,7 @@ def bench(n, dim=64, n_queries=30, k=10, pq_m=16, nprobe=None, seed=0,
             n, dim, recall_sample, k, seed, batch_size)
         hits = 0
         for query, query_true_ids in zip(recall_sample, true_ids):
-            got_ids, _ = idx.search(
-                query, k=k, nprobe=nprobe, rerank=rerank)
+            got_ids, _ = idx.search(query, **search_kwargs)
             hits += len(set(query_true_ids.tolist()) & set(got_ids))
         recall = hits / (recall_queries * k)
         recall_time = time.perf_counter() - recall_start
@@ -244,11 +260,20 @@ def bench(n, dim=64, n_queries=30, k=10, pq_m=16, nprobe=None, seed=0,
     disk_bytes = idx.disk_bytes()
     mem_bytes = idx.resident_memory_bytes()
 
+    candidate_counts = [
+        idx._select_probe_clusters(
+            query, nprobe=nprobe, max_candidates=max_candidates)[1]
+        for query in queries
+    ]
     result = {
         "n": n, "dim": dim, "nlist": nlist, "nprobe": nprobe, "pq_m": pq_m,
+        "candidate_budget": max_candidates,
+        "average_candidates_scanned": round(float(np.mean(candidate_counts)), 1),
         "store_full_vectors": store_full_vectors,
         "rerank": rerank,
         "routing_backend": routing_backend,
+        "pq_mode": pq_mode,
+        "coarse_training": coarse_training,
         "train_n": train_n,
         "train_minibatch_size": train_minibatch_size,
         "pq_train_size": pq_train_size,
@@ -258,6 +283,11 @@ def bench(n, dim=64, n_queries=30, k=10, pq_m=16, nprobe=None, seed=0,
         "total_index_time_s": round(train_time + build_time + compact_time, 3),
         "build_vectors_per_sec": round(n / build_time, 1),
         "query_time_ms": round(query_time * 1000, 4),
+        "first_query_time_ms": round(first_query_time * 1000, 4),
+        "query_p50_ms": round(float(np.percentile(latencies, 50)) * 1000, 4),
+        "query_p95_ms": round(float(np.percentile(latencies, 95)) * 1000, 4),
+        "query_p99_ms": round(float(np.percentile(latencies, 99)) * 1000, 4),
+        "warmup_queries": warmup_queries,
         "unpacked_query_time_ms": round(unpacked_query_time * 1000, 4)
         if unpacked_query_time is not None else None,
         "packed_query_speedup": round(unpacked_query_time / query_time, 3)
@@ -299,9 +329,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Streamed IVF+PQ scale benchmark")
     parser.add_argument("n", nargs="?", type=int, default=10_000)
     parser.add_argument("--dim", type=int, default=64)
-    parser.add_argument("--queries", type=int, default=30)
+    parser.add_argument("--queries", type=int, default=100)
     parser.add_argument("--pq-m", type=int, default=16)
+    parser.add_argument("--nlist", type=int)
     parser.add_argument("--nprobe", type=int)
+    parser.add_argument("--candidate-budget", type=int)
     parser.add_argument("--train-iters", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=100_000)
     parser.add_argument("--progress-every", type=int, default=1_000_000)
@@ -320,26 +352,38 @@ if __name__ == "__main__":
         "--routing-backend", choices=("numpy", "mlx"), default="numpy",
         help="coarse ingestion routing backend; mlx uses Apple Silicon GPU")
     parser.add_argument(
+        "--pq-mode", choices=("standard", "residual"), default="standard")
+    parser.add_argument(
+        "--coarse-training", choices=("legacy", "accumulated"),
+        default="legacy")
+    parser.add_argument("--warmup-queries", type=int, default=5)
+    parser.add_argument(
         "--rerank", type=int, default=0,
         help="exactly rerank this many PQ finalists; enables raw-vector storage")
     parser.add_argument(
         "--recall-queries", type=int, default=3,
         help="exact streaming recall queries above 2M vectors; use 0 to skip")
     args = parser.parse_args()
+    if args.nprobe is not None and args.candidate_budget is not None:
+        parser.error("--nprobe and --candidate-budget are mutually exclusive")
 
     train_minibatch_size = args.train_minibatch_size or None
     pq_train_size = args.pq_train_size or None
-    nlist = max(int(4 * np.sqrt(args.n)), 16)
-    selected_nprobe = args.nprobe if args.nprobe is not None else max(1, nlist // 20)
+    nlist = args.nlist or max(int(4 * np.sqrt(args.n)), 16)
+    selected_nprobe = args.nprobe
+    if selected_nprobe is None and args.candidate_budget is None:
+        selected_nprobe = max(1, nlist // 20)
     store_full_vectors = args.store_full_vectors or args.rerank > 0
     record_bytes = 8 + args.pq_m + (8 if store_full_vectors else 0)
     expected_mb = args.n * (
         record_bytes + (args.dim * 4 if store_full_vectors else 0)
     ) / (1024 * 1024)
-    expected_candidates = args.n * selected_nprobe / nlist
+    expected_candidates = (args.candidate_budget if args.candidate_budget is not None
+                           else args.n * selected_nprobe / nlist)
     print(f"=== IVF+PQ benchmark: n={args.n} ===")
     print(f"  [preflight: nlist={nlist}, nprobe={selected_nprobe}, "
-          f"routing={args.routing_backend}, rerank={args.rerank}, "
+          f"candidate_budget={args.candidate_budget}, routing={args.routing_backend}, "
+          f"pq_mode={args.pq_mode}, rerank={args.rerank}, "
           f"expected_disk={expected_mb:.1f} MiB, "
           f"expected_candidates/query={expected_candidates:.0f}]", flush=True)
     if args.dry_run:
@@ -350,6 +394,8 @@ if __name__ == "__main__":
         n_queries=args.queries,
         pq_m=args.pq_m,
         nprobe=args.nprobe,
+        nlist=args.nlist,
+        max_candidates=args.candidate_budget,
         train_iters=args.train_iters,
         batch_size=args.batch_size,
         progress_every=args.progress_every,
@@ -362,4 +408,7 @@ if __name__ == "__main__":
         store_full_vectors=store_full_vectors,
         rerank=args.rerank,
         routing_backend=args.routing_backend,
+        pq_mode=args.pq_mode,
+        coarse_training=args.coarse_training,
+        warmup_queries=args.warmup_queries,
     )
