@@ -44,7 +44,8 @@ from .pq import ProductQuantizer
 
 
 def _kmeans(data, k, n_iters, rng, batch_size=20000, minibatch_size=None,
-            tol=1e-4, max_distance_bytes=256 * 1024 * 1024):
+            tol=1e-4, max_distance_bytes=256 * 1024 * 1024,
+            training_mode="legacy"):
     """Same Lloyd's algorithm as ProductQuantizer._kmeans, factored out
     here since IVF needs to cluster full vectors, not PQ's subvectors.
 
@@ -116,6 +117,8 @@ def _kmeans(data, k, n_iters, rng, batch_size=20000, minibatch_size=None,
        the same buffer, cutting peak temporary memory for this step
        roughly in half without changing the result.
     """
+    if training_mode not in {"legacy", "accumulated"}:
+        raise ValueError("training_mode must be 'legacy' or 'accumulated'")
     n = len(data)
     # The distance matrix is float32 with shape (batch, k).  A fixed row
     # batch of 20k is already ~1.5 GiB when k=20k (the 25M-vector benchmark),
@@ -129,6 +132,8 @@ def _kmeans(data, k, n_iters, rng, batch_size=20000, minibatch_size=None,
     if full_batch:
         data_sq_full = (data ** 2).sum(axis=1)  # (n,), computed once, reused every iteration
 
+    accumulated_sums = np.zeros((k, data.shape[1]), dtype=np.float64)
+    accumulated_counts = np.zeros(k, dtype=np.int64)
     for _ in range(n_iters):
         if full_batch:
             sample = data
@@ -154,13 +159,29 @@ def _kmeans(data, k, n_iters, rng, batch_size=20000, minibatch_size=None,
             dists += centroids_sq[None, :]
             assignments[start:end] = dists.argmin(axis=1)
 
-        new_centroids = np.zeros_like(centroids)
-        counts = np.zeros(k, dtype=np.float64)
-        np.add.at(new_centroids, assignments, sample)
+        batch_sums = np.zeros_like(centroids)
+        counts = np.zeros(k, dtype=np.int64)
+        np.add.at(batch_sums, assignments, sample)
         np.add.at(counts, assignments, 1)
 
+        if training_mode == "accumulated" and not full_batch:
+            accumulated_sums += batch_sums
+            accumulated_counts += counts
+            new_centroids = centroids.copy()
+            occupied = accumulated_counts > 0
+            new_centroids[occupied] = (
+                accumulated_sums[occupied]
+                / accumulated_counts[occupied, None]
+            ).astype(np.float32)
+            shift = np.abs(new_centroids - centroids).max()
+            centroids = new_centroids
+            if shift < tol:
+                break
+            continue
+
+        new_centroids = batch_sums
         empty = counts == 0
-        counts[empty] = 1  # avoid div-by-zero; overwritten below anyway
+        counts[empty] = 1
         new_centroids /= counts[:, None]
         new_centroids[empty] = centroids[empty]  # empty cluster, keep old position
 
@@ -176,7 +197,8 @@ class IVFPQIndex:
     def __init__(self, dim: int, nlist: int, pq_m: int = 16, pq_k: int = 256,
                  storage_dir: str = "./ivf_storage", seed: int = 0,
                  store_full_vectors: bool = False,
-                 routing_backend: str = "numpy"):
+                 routing_backend: str = "numpy",
+                 pq_mode: str = "standard"):
         """
         dim: vector dimensionality
         nlist: number of coarse clusters. This is THE memory-vs-recall
@@ -192,6 +214,10 @@ class IVFPQIndex:
         self.storage_dir = storage_dir
         self.rng = np.random.default_rng(seed)
         self.store_full_vectors = bool(store_full_vectors)
+        if pq_mode not in {"standard", "residual"}:
+            raise ValueError("pq_mode must be 'standard' or 'residual'")
+        self.pq_mode = pq_mode
+        self.coarse_training = "legacy"
         if routing_backend not in {"numpy", "mlx"}:
             raise ValueError("routing_backend must be 'numpy' or 'mlx'")
         self.routing_backend = routing_backend
@@ -285,7 +311,8 @@ class IVFPQIndex:
 
     def train(self, training_vectors: np.ndarray, n_iters: int = 15,
               minibatch_size: int = None, tol: float = 1e-4,
-              pq_train_size: int = None):
+              pq_train_size: int = None,
+              coarse_training: str = "legacy"):
         """One-time setup: learn both the coarse cluster centroids AND the
         PQ codebooks from a representative sample. Neither needs the full
         dataset, a sample large enough to be representative is enough.
@@ -307,14 +334,23 @@ class IVFPQIndex:
         assert len(training_vectors) >= self.nlist, \
             f"need at least nlist={self.nlist} training vectors, got {len(training_vectors)}"
 
-        self.centroids = _kmeans(training_vectors, self.nlist, n_iters, self.rng,
-                                  minibatch_size=minibatch_size, tol=tol)
+        if coarse_training not in {"legacy", "accumulated"}:
+            raise ValueError("coarse_training must be 'legacy' or 'accumulated'")
+        self.coarse_training = coarse_training
+        self.centroids = _kmeans(
+            training_vectors, self.nlist, n_iters, self.rng,
+            minibatch_size=minibatch_size, tol=tol,
+            training_mode=coarse_training)
         self._centroid_norms = (self.centroids ** 2).sum(axis=1)
         pq_training_vectors = training_vectors
         if pq_train_size is not None and pq_train_size < len(training_vectors):
             pq_idx = self.rng.choice(
                 len(training_vectors), size=pq_train_size, replace=False)
             pq_training_vectors = training_vectors[pq_idx]
+        if self.pq_mode == "residual":
+            assignments = self._nearest_clusters(pq_training_vectors)
+            pq_training_vectors = (
+                pq_training_vectors - self.centroids[assignments])
         self.pq.train(pq_training_vectors, n_iters=n_iters)
         self._trained = True
         self._close_packed()
@@ -418,7 +454,10 @@ class IVFPQIndex:
             return
 
         cluster_ids = self._nearest_clusters(vectors, assignment_batch_size)
-        codes = self.pq.encode(vectors, batch_size=pq_batch_size)
+        pq_vectors = vectors
+        if self.pq_mode == "residual":
+            pq_vectors = vectors - self.centroids[cluster_ids]
+        codes = self.pq.encode(pq_vectors, batch_size=pq_batch_size)
 
         raw_rows = None
         if self.store_full_vectors:
@@ -565,66 +604,116 @@ class IVFPQIndex:
             "path": packed_path,
         }
 
-    def search(self, query, k=10, nprobe=8, rerank=0):
-        """nprobe: how many of the nlist clusters to actually read from
-        disk and search. This is the speed/recall dial, same spirit as
-        HNSW's ef_search and PQ's m: more probes = better recall, more
-        disk I/O and compute, fewer = faster, more likely to miss the
-        true answer if it's sitting in an unprobed cluster."""
+    def _select_probe_clusters(self, query, nprobe=None, max_candidates=None):
+        """Select posting lists by count or by their accumulated record size.
+
+        Candidate-budget routing makes configurations with different ``nlist``
+        directly comparable: it follows centroid-distance order and stops once
+        the selected lists contain at least the requested number of records.
+        The last list may take the actual count slightly over the budget.
+        """
+        if nprobe is not None and max_candidates is not None:
+            raise ValueError("nprobe and max_candidates are mutually exclusive")
+        if nprobe is None and max_candidates is None:
+            nprobe = 8
+        if nprobe is not None and nprobe <= 0:
+            raise ValueError("nprobe must be positive")
+        if max_candidates is not None and max_candidates <= 0:
+            raise ValueError("max_candidates must be positive")
+
+        cluster_dists = self._centroid_norms.copy()
+        cluster_dists -= 2.0 * (self.centroids @ query)
+        if max_candidates is not None:
+            order = np.argsort(cluster_dists)
+            cumulative = np.cumsum(self._cluster_sizes[order], dtype=np.int64)
+            stop = int(np.searchsorted(cumulative, max_candidates, side="left")) + 1
+            stop = min(max(stop, 1), self.nlist)
+            probe_clusters = order[:stop]
+        else:
+            nprobe = min(int(nprobe), self.nlist)
+            if nprobe == self.nlist:
+                probe_clusters = np.argsort(cluster_dists)
+            else:
+                probe_clusters = np.argpartition(cluster_dists, nprobe - 1)[:nprobe]
+                probe_clusters = probe_clusters[np.argsort(cluster_dists[probe_clusters])]
+        scanned = int(self._cluster_sizes[probe_clusters].sum())
+        return probe_clusters, scanned
+
+    def _approximate_shortlist(self, query, shortlist_size, nprobe=None,
+                               max_candidates=None, scan_chunk_size=65536):
+        """Stream selected postings and retain only the best global shortlist."""
+        if shortlist_size <= 0:
+            raise ValueError("shortlist_size must be positive")
+        if scan_chunk_size <= 0:
+            raise ValueError("scan_chunk_size must be positive")
+        probe_clusters, scanned = self._select_probe_clusters(
+            query, nprobe=nprobe, max_candidates=max_candidates)
+        best_records = self._empty_records()
+        best_dists = np.empty(0, dtype=np.float32)
+        standard_table = (
+            self.pq.distance_table(query) if self.pq_mode == "standard" else None)
+
+        for cluster_id in probe_clusters:
+            cluster_id = int(cluster_id)
+            records = self._read_cluster(cluster_id)
+            if len(records) == 0:
+                continue
+            table = standard_table
+            if self.pq_mode == "residual":
+                table = self.pq.distance_table(query - self.centroids[cluster_id])
+            for start in range(0, len(records), scan_chunk_size):
+                chunk = records[start:start + scan_chunk_size]
+                dists = self.pq.asymmetric_distances(chunk["code"], table)
+                local_size = min(shortlist_size, len(chunk))
+                local = np.argpartition(dists, local_size - 1)[:local_size]
+                candidate_records = np.concatenate((best_records, chunk[local]))
+                candidate_dists = np.concatenate((best_dists, dists[local]))
+                keep_size = min(shortlist_size, len(candidate_dists))
+                keep = np.argpartition(candidate_dists, keep_size - 1)[:keep_size]
+                best_records = candidate_records[keep]
+                best_dists = candidate_dists[keep]
+
+        if len(best_dists):
+            order = np.argsort(best_dists)
+            best_records = best_records[order]
+            best_dists = best_dists[order]
+        return best_records, best_dists, scanned
+
+    def search(self, query, k=10, nprobe=None, max_candidates=None, rerank=0):
+        """Search using either a probe count or an approximate scan budget.
+
+        If neither routing control is supplied, eight posting lists are
+        probed for backward compatibility. Supplying both is an error.
+        ``rerank`` selects that many PQ finalists for exact raw-vector L2.
+        """
         assert self._trained, "call train() first"
         query = np.asarray(query, dtype=np.float32)
 
         if query.shape != (self.dim,):
             raise ValueError(f"expected a flat query of dim {self.dim}, got {query.shape}")
-        if k <= 0 or nprobe <= 0 or rerank < 0:
-            raise ValueError("k and nprobe must be positive and rerank must be non-negative")
+        if k <= 0 or rerank < 0:
+            raise ValueError("k must be positive and rerank must be non-negative")
         if rerank and not self.store_full_vectors:
             raise ValueError(
                 "reranking requires an index created with store_full_vectors=True")
-
-        nprobe = min(nprobe, self.nlist)
-        # The query norm is constant for every centroid, so it is omitted.
-        cluster_dists = self._centroid_norms.copy()
-        cluster_dists -= 2.0 * (self.centroids @ query)
-        if nprobe == self.nlist:
-            probe_clusters = np.arange(self.nlist)
-        else:
-            probe_clusters = np.argpartition(cluster_dists, nprobe - 1)[:nprobe]
-            probe_clusters = probe_clusters[np.argsort(cluster_dists[probe_clusters])]
-
-        all_records = []
-        table = self.pq.distance_table(query)
-
-        for cluster_id in probe_clusters:
-            records = self._read_cluster(int(cluster_id))
-            if len(records) == 0:
-                continue
-            all_records.append(records)
-
-        if not all_records:
+        shortlist_size = max(k, rerank) if rerank else k
+        records, approximate_dists, _ = self._approximate_shortlist(
+            query, shortlist_size, nprobe=nprobe,
+            max_candidates=max_candidates)
+        if len(records) == 0:
             return [], []
-
-        records = np.concatenate(all_records)
-        approximate_dists = self.pq.asymmetric_distances(records["code"], table)
         k = min(k, len(records))
 
         if rerank:
-            shortlist_size = min(len(records), max(k, rerank))
-            shortlist = np.argpartition(
-                approximate_dists, shortlist_size - 1)[:shortlist_size]
             self._map_raw()
-            raw_rows = records["raw_row"][shortlist]
+            raw_rows = records["raw_row"]
             exact_vectors = np.asarray(self._raw_vectors[raw_rows])
             exact_dists = ((exact_vectors - query) ** 2).sum(axis=1)
             final = np.argpartition(exact_dists, k - 1)[:k]
             final = final[np.argsort(exact_dists[final])]
-            selected = shortlist[final]
-            return records["id"][selected].tolist(), exact_dists[final].tolist()
+            return records["id"][final].tolist(), exact_dists[final].tolist()
 
-        top_k_idx = np.argpartition(approximate_dists, k - 1)[:k]
-        top_k_idx = top_k_idx[np.argsort(approximate_dists[top_k_idx])]
-        return (records["id"][top_k_idx].tolist(),
-                approximate_dists[top_k_idx].tolist())
+        return records["id"][:k].tolist(), approximate_dists[:k].tolist()
 
     def resident_memory_bytes(self):
         """What's ACTUALLY kept in RAM, independent of how many vectors
@@ -682,6 +771,7 @@ class IVFPQIndex:
         assert self._trained, "nothing to save, call train() first"
         path = path or os.path.join(self.storage_dir, "index_meta.npz")
         payload = dict(
+            storage_version=3,
             centroids=self.centroids,
             codebooks=self.pq.codebooks,
             cluster_sizes=self._cluster_sizes,
@@ -692,11 +782,12 @@ class IVFPQIndex:
             store_full_vectors=self.store_full_vectors,
             raw_count=self._raw_count,
             routing_backend=self.routing_backend,
+            pq_mode=self.pq_mode,
+            coarse_training=self.coarse_training,
         )
         if self.is_compacted:
             payload["packed_offsets"] = self._packed_offsets
             payload["base_cluster_sizes"] = self._base_cluster_sizes
-            payload["storage_version"] = 2
         np.savez(path, **payload)
         return path
 
@@ -720,11 +811,16 @@ class IVFPQIndex:
             routing_backend = (
                 str(data["routing_backend"])
                 if "routing_backend" in data.files else "numpy")
+        pq_mode = str(data["pq_mode"]) if "pq_mode" in data.files else "standard"
         idx = cls(int(data["dim"]), int(data["nlist"]),
                   pq_m=int(data["pq_m"]), pq_k=int(data["pq_k"]),
                   storage_dir=storage_dir,
                   store_full_vectors=store_full_vectors,
-                  routing_backend=routing_backend)
+                  routing_backend=routing_backend,
+                  pq_mode=pq_mode)
+        idx.coarse_training = (
+            str(data["coarse_training"])
+            if "coarse_training" in data.files else "legacy")
         idx.centroids = data["centroids"]
         idx._centroid_norms = (idx.centroids ** 2).sum(axis=1)
         idx.pq.codebooks = data["codebooks"]
