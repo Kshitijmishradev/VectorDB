@@ -1,0 +1,48 @@
+{
+  "vectors": 100000,
+  "dim": 64,
+  "nlist": 20000,
+  "cpu": {
+    "chunk_size": 838,
+    "seconds": 1.5896884170069825,
+    "vectors_per_second": 62905.40896578777
+  },
+  "gpu": [
+    {
+      "chunk_size": 512,
+      "seconds": 0.5674825829919428,
+      "vectors_per_second": 176216.86197445786,
+      "speedup_vs_cpu": 2.8012990436211385,
+      "assignment_mismatches": 0,
+      "assignment_match_percent": 100.0,
+      "distance_matrix_MiB": 39.0625
+    },
+    {
+      "chunk_size": 1024,
+      "seconds": 0.5370565409975825,
+      "vectors_per_second": 186200.13418745447,
+      "speedup_vs_cpu": 2.9600019656294223,
+      "assignment_mismatches": 0,
+      "assignment_match_percent": 100.0,
+      "distance_matrix_MiB": 78.125
+    },
+    {
+      "chunk_size": 2048,
+      "seconds": 0.5905907499982277,
+      "vectors_per_second": 169321.98819622572,
+      "speedup_vs_cpu": 2.6916920338013304,
+      "assignment_mismatches": 0,
+      "assignment_match_percent": 100.0,
+      "distance_matrix_MiB": 156.25
+    },
+    {
+      "chunk_size": 4096,
+      "seconds": 0.6721985409967601,
+      "vectors_per_second": 148765.57133211923,
+      "speedup_vs_cpu": 2.36490905596096,
+      "assignment_mismatches": 0,
+      "assignment_match_percent": 100.0,
+      "distance_matrix_MiB": 312.5
+    }
+  ]
+}
