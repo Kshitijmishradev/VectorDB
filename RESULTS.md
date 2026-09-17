@@ -4,6 +4,32 @@ Read this top to bottom in the morning, it tells the whole story: what got
 built, what the tests say, and one important honest finding that changes
 what we do next.
 
+## Higher-recall search and SIFT1M validation
+
+The IVF+PQ engine now supports opt-in residual PQ, candidate-budget routing,
+streaming top-N scans, exact reranking, accumulated coarse training, and
+metadata version 3 with version-2 compatibility. Search no longer concatenates
+every probed posting or creates a candidate-by-`pq_m` contribution matrix.
+
+The final official SIFT1M run on the M3 Pro used all 10,000 queries:
+
+```text
+n=1,000,000  dim=128  nlist=4,096  candidate_budget=20,000
+pq_mode=residual  pq_m=32  rerank=100
+recall@1=0.9782  recall@10=0.9701
+p50=9.3691ms  p95=13.4028ms  p99=14.6929ms  QPS=104.05
+train=11.568s  build=10.669s  compact=0.299s
+```
+
+This passed the fixed acceptance target (recall@10 ≥ 0.80, p50 ≤ 75 ms,
+p95 ≤ 100 ms). A same-data 200-query comparison measured legacy standard PQ
+at recall@10 0.5225 / p95 2.2645 ms and the optimized mode at recall@10
+0.9735 / p95 13.8362 ms.
+
+The separate 25% boundary-replication experiment failed its promotion gate:
+at matched ~20.3k scanned records, recall changed from 0.9740 to 0.9695.
+Replication therefore remains out of the persistent format.
+
 ## What got built tonight
 
 **`vectordb/brute_force.py`** — the ground-truth exact search index.
